@@ -6,7 +6,6 @@
     "passthroughHosts": [
       "localhost",
       "127.0.0.1",
-      "api-stg.chatbot.ensou.app",
       "ab.chatgpt.com",
       "api.anthropic.com",
       "registry.npmjs.org",

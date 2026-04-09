@@ -42,6 +42,24 @@ sudo update-ca-certificates
 - `~/.mitmproxy` を消して CA が再生成されたら、再登録が必要
 - 一部ツールは system CA を見ないので、その場合は個別に `SSL_CERT_FILE` や `AWS_CA_BUNDLE` が必要
 
+AWS CLI v2 について:
+
+- `update-ca-certificates` をしていても、AWS CLI v2 は system trust store ではなく自前の CA bundle を使うことがあります
+- その場合、proxy 経由の `aws eks list-clusters` は `CERTIFICATE_VERIFY_FAILED` で落ちます
+- いちばん安定するのは `~/.aws/config` の `[default]` に `ca_bundle = /etc/ssl/certs/ca-certificates.crt` を入れるやり方です
+
+```ini
+[default]
+region = ap-northeast-1
+ca_bundle = /etc/ssl/certs/ca-certificates.crt
+```
+
+注意:
+
+- `ca_bundle` は `[default]` セクションに入れる
+- パスは `.crt` まで含めて正確に書く
+- `.cr` などにすると効かず、proxy 経由だけ unknown ca になります
+
 ## 起動
 
 ```bash

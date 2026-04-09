@@ -113,16 +113,68 @@ system CA を見ないクライアントがあります。
 Python / AWS CLI:
 
 ```bash
-export SSL_CERT_FILE="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
-export REQUESTS_CA_BUNDLE="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
-export AWS_CA_BUNDLE="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+export SSL_CERT_FILE="/$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+export REQUESTS_CA_BUNDLE="/$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+export AWS_CA_BUNDLE="/$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
 ```
 
 Node.js:
 
 ```bash
-export NODE_EXTRA_CA_CERTS="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+export NODE_EXTRA_CA_CERTS="/$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
 ```
+
+## AWS CLI v2 で特に注意すること
+
+AWS CLI v2 は、system trust store をそのまま使わず、自前の CA bundle を見ることがあります。
+
+そのため、Ubuntu / WSL で `sudo update-ca-certificates` を実行済みでも、proxy 経由の AWS API だけが次のように失敗することがあります。
+
+```text
+SSL validation failed for https://eks.ap-northeast-1.amazonaws.com/clusters
+[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate
+```
+
+この症状が出たら、まず `~/.aws/config` の `[default]` に `ca_bundle` を入れてください。
+
+```ini
+[default]
+region = ap-northeast-1
+ca_bundle = /etc/ssl/certs/ca-certificates.crt
+```
+
+背景:
+
+- `mitmproxy` の CA は system trust store に入っている
+- でも AWS CLI v2 は別の CA bundle を参照していることがある
+- その結果、直実行は通るのに proxy 経由だけ unknown ca になる
+
+確認コマンド:
+
+```bash
+aws configure get ca_bundle
+aws configure list
+```
+
+期待する値:
+
+- `aws configure get ca_bundle` が `/etc/ssl/certs/ca-certificates.crt`
+- `aws configure list` の `profile` が意図したもの
+
+よくあるミス:
+
+- `ca_bundle` を `[default]` ではなく別セクションに入れてしまう
+- `/etc/ssl/certs/ca-certificates.crt` を typo する
+  例: `.cr` と書くと効かない
+- `AWS_CA_BUNDLE` 環境変数が残っていて、config よりそちらが優先される
+
+一時的に環境変数で通すならこれでも構いません。
+
+```bash
+export AWS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+```
+
+ただし毎回入れるのは面倒なので、通常は `~/.aws/config` の `[default]` に書くのがおすすめです。
 
 ## `proxy.config.json` の考え方
 

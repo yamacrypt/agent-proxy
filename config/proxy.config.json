@@ -1,0 +1,37 @@
+{
+  "host": "127.0.0.1",
+  "port": 8787,
+  "suppressTlsClientErrors": true,
+  "tls": {
+    "passthroughHosts": [
+      "localhost",
+      "127.0.0.1",
+      "api-stg.chatbot.ensou.app",
+      "ab.chatgpt.com",
+      "api.anthropic.com",
+      "api.vibekanban.com",
+      "api.github.com",
+      "github.com",
+      "registry.npmjs.org",
+      "api.openai.com",
+      "chatgpt.com",
+      "auth.openai.com",
+      "mcp.linear.app"
+    ]
+  },
+  "requestFiltering": {
+    "inspectFallbackAllowedMethods": ["GET"],
+    "allowRules": [
+      {
+        "name": "aws eks list-clusters",
+        "methods": ["GET"],
+        "protocols": ["https"],
+        "hosts": ["eks.ap-northeast-1.amazonaws.com"],
+        "pathPatterns": [
+          "/clusters*"
+        ],
+        "notes": "EKS の cluster list 用。SSO token refresh は oidc/signin/sts を passthrough で通す。"
+      }
+    ]
+  }
+}

@@ -4,6 +4,8 @@ Drop-in replacement for the Node.js codex-proxy using mitmproxy/mitmdump.
 Uses the same proxy.config.json format.
 """
 
+import base64
+import binascii
 import json
 import os
 import re
@@ -19,6 +21,13 @@ from mitmproxy import ctx, http, tls
 # ---------------------------------------------------------------------------
 
 _ESCAPE_RE = re.compile(r"([|\\{}()\[\]^$+?.])")
+DEFAULT_AWS_HOST_PATTERNS = [
+    "*.amazonaws.com",
+    "*.amazonaws.com.cn",
+    "*.api.aws",
+    "*.signin.aws.amazon.com",
+]
+CONNECT_DECISION_TTL_SECONDS = 30
 
 
 def _escape_regexp(value: str) -> str:
@@ -101,6 +110,36 @@ def get_optional_string_array(
     return value
 
 
+def get_optional_string(
+    record: dict[str, Any], key: str, label: str
+) -> Optional[str]:
+    value = record.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    return value
+
+
+def get_optional_bool(
+    record: dict[str, Any], key: str, label: str
+) -> Optional[bool]:
+    value = record.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"{label} must be a boolean")
+    return value
+
+
+def validate_enum(
+    value: str, label: str, allowed: list[str]
+) -> None:
+    if value not in allowed:
+        joined = ", ".join(allowed)
+        raise ValueError(f"{label} must be one of: {joined}")
+
+
 def string_array_or_default(
     value: Optional[list[str]], default: list[str]
 ) -> list[str]:
@@ -149,7 +188,9 @@ def host_has_explicit_rules(hostname: str, config: dict[str, Any]) -> bool:
 
 
 def evaluate_request(
-    request: dict[str, Any], config: dict[str, Any]
+    request: dict[str, Any],
+    config: dict[str, Any],
+    aws_profile: Optional[str] = None,
 ) -> dict[str, Any]:
     method = request["method"].upper()
     default_methods = [
@@ -164,6 +205,18 @@ def evaluate_request(
             "allowed": True,
             "reason": f"passthrough host: {request['hostname']}",
         }
+
+    aws_decision = evaluate_aws_profile_passthrough(
+        request["hostname"], config, aws_profile
+    )
+    if aws_decision:
+        if aws_decision["allowed"]:
+            return {
+                "allowed": True,
+                "reason": aws_decision["reason"],
+                "awsProfile": aws_profile,
+            }
+        return aws_decision
 
     if host_has_explicit_rules(request["hostname"], config):
         for rule in config["requestFiltering"]["allowRules"]:
@@ -180,7 +233,10 @@ def evaluate_request(
 
 
 def evaluate_connect(
-    hostname: str, port: int, config: dict[str, Any]
+    hostname: str,
+    port: int,
+    config: dict[str, Any],
+    aws_profile: Optional[str] = None,
 ) -> dict[str, Any]:
     if config["tls"]["passthroughHosts"] and matches_globs(
         hostname, config["tls"]["passthroughHosts"]
@@ -190,6 +246,19 @@ def evaluate_connect(
             "action": "passthrough",
             "reason": f"passthrough host: {hostname}",
         }
+
+    aws_decision = evaluate_aws_profile_passthrough(
+        hostname, config, aws_profile
+    )
+    if aws_decision:
+        if aws_decision["allowed"]:
+            return {
+                "allowed": True,
+                "action": "passthrough",
+                "reason": aws_decision["reason"],
+                "awsProfile": aws_profile,
+            }
+        return aws_decision
 
     matched_rule = find_inspect_rule_for_host(hostname, config)
     if matched_rule:
@@ -207,6 +276,74 @@ def evaluate_connect(
         }
 
     return {"allowed": False, "reason": f"blocked CONNECT {hostname}:{port}"}
+
+
+def is_aws_host(hostname: str, config: dict[str, Any]) -> bool:
+    aws_config = config.get("aws", {})
+    if not aws_config.get("enabled"):
+        return False
+    return matches_globs(
+        hostname, aws_config["profilePassthrough"]["hostPatterns"]
+    )
+
+
+def evaluate_aws_profile_passthrough(
+    hostname: str,
+    config: dict[str, Any],
+    aws_profile: Optional[str],
+) -> Optional[dict[str, Any]]:
+    if not is_aws_host(hostname, config):
+        return None
+
+    passthrough = config["aws"]["profilePassthrough"]
+    if aws_profile is None:
+        if passthrough["onMissingProfile"] == "block":
+            return {
+                "allowed": False,
+                "reason": (
+                    f"blocked AWS host without profile selector: {hostname}"
+                ),
+            }
+        return None
+
+    if aws_profile in passthrough["profiles"]:
+        return {
+            "allowed": True,
+            "reason": f"aws profile passthrough: {aws_profile}",
+            "awsProfile": aws_profile,
+        }
+
+    return None
+
+
+def extract_aws_profile_from_proxy_auth(
+    headers: dict[str, str], config: dict[str, Any]
+) -> Optional[str]:
+    if not config.get("aws", {}).get("enabled"):
+        return None
+
+    raw = headers.get("proxy-authorization")
+    if not raw:
+        return None
+
+    scheme, _, token = raw.partition(" ")
+    if scheme.lower() != "basic" or not token:
+        return None
+
+    try:
+        decoded = base64.b64decode(token.strip(), validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return None
+
+    username, separator, password = decoded.partition(":")
+    if (
+        separator != ":"
+        or username != config["aws"]["profileSelector"]["username"]
+        or not password
+    ):
+        return None
+
+    return password
 
 
 # ---------------------------------------------------------------------------
@@ -230,12 +367,24 @@ def load_config(config_path: str) -> dict[str, Any]:
             "suppressTlsClientErrors",
             "tls",
             "requestFiltering",
+            "aws",
         ],
     )
 
     tls = get_optional_object(raw.get("tls"), "tls") or {}
     request_filtering = (
         get_optional_object(raw.get("requestFiltering"), "requestFiltering") or {}
+    )
+    aws = get_optional_object(raw.get("aws"), "aws") or {}
+    profile_selector = (
+        get_optional_object(aws.get("profileSelector"), "aws.profileSelector")
+        or {}
+    )
+    profile_passthrough = (
+        get_optional_object(
+            aws.get("profilePassthrough"), "aws.profilePassthrough"
+        )
+        or {}
     )
 
     validate_keys(tls, "tls", ["passthroughHosts"])
@@ -244,10 +393,46 @@ def load_config(config_path: str) -> dict[str, Any]:
         "requestFiltering",
         ["inspectFallbackAllowedMethods", "allowRules"],
     )
+    validate_keys(aws, "aws", ["enabled", "profileSelector", "profilePassthrough"])
+    validate_keys(
+        profile_selector,
+        "aws.profileSelector",
+        ["type", "username"],
+    )
+    validate_keys(
+        profile_passthrough,
+        "aws.profilePassthrough",
+        ["profiles", "hostPatterns", "onMissingProfile"],
+    )
 
     allow_rules = request_filtering.get("allowRules", [])
     if not isinstance(allow_rules, list):
         raise ValueError("requestFiltering.allowRules must be an array")
+
+    aws_enabled = get_optional_bool(aws, "enabled", "aws.enabled")
+    profile_selector_type = get_optional_string(
+        profile_selector,
+        "type",
+        "aws.profileSelector.type",
+    )
+    if profile_selector_type is not None:
+        validate_enum(
+            profile_selector_type,
+            "aws.profileSelector.type",
+            ["proxyBasicAuth"],
+        )
+
+    on_missing_profile = get_optional_string(
+        profile_passthrough,
+        "onMissingProfile",
+        "aws.profilePassthrough.onMissingProfile",
+    )
+    if on_missing_profile is not None:
+        validate_enum(
+            on_missing_profile,
+            "aws.profilePassthrough.onMissingProfile",
+            ["inspect", "block"],
+        )
 
     return {
         "host": raw.get("host", "127.0.0.1"),
@@ -272,6 +457,37 @@ def load_config(config_path: str) -> dict[str, Any]:
             ),
             "allowRules": allow_rules,
         },
+        "aws": {
+            "enabled": aws_enabled if aws_enabled is not None else False,
+            "profileSelector": {
+                "type": profile_selector_type or "proxyBasicAuth",
+                "username": get_optional_string(
+                    profile_selector,
+                    "username",
+                    "aws.profileSelector.username",
+                )
+                or "aws",
+            },
+            "profilePassthrough": {
+                "profiles": string_array_or_default(
+                    get_optional_string_array(
+                        profile_passthrough,
+                        "profiles",
+                        "aws.profilePassthrough.profiles",
+                    ),
+                    [],
+                ),
+                "hostPatterns": string_array_or_default(
+                    get_optional_string_array(
+                        profile_passthrough,
+                        "hostPatterns",
+                        "aws.profilePassthrough.hostPatterns",
+                    ),
+                    DEFAULT_AWS_HOST_PATTERNS,
+                ),
+                "onMissingProfile": on_missing_profile or "inspect",
+            },
+        },
     }
 
 
@@ -287,7 +503,70 @@ class CodexProxy:
             str(Path(__file__).parent / "config" / "proxy.config.json"),
         )
         self.config = load_config(self.config_path)
+        self._connect_decisions: dict[tuple[str, str, int], dict[str, Any]] = {}
         self._start_watcher()
+
+    def _cache_key(
+        self, client_id: Optional[Any], hostname: str, port: int
+    ) -> Optional[tuple[str, str, int]]:
+        if client_id is None:
+            return None
+        return (str(client_id), hostname.lower(), port)
+
+    def _prune_connect_decisions(
+        self, client_id: Optional[Any] = None
+    ) -> None:
+        now = time.time()
+        target_client = str(client_id) if client_id is not None else None
+        keys_to_delete: list[tuple[str, str, int]] = []
+
+        for key, decision in self._connect_decisions.items():
+            expired = decision.get("expiresAt", 0) <= now
+            same_client = target_client is not None and key[0] == target_client
+            if expired or same_client:
+                keys_to_delete.append(key)
+
+        for key in keys_to_delete:
+            self._connect_decisions.pop(key, None)
+
+    def _store_connect_decision(
+        self,
+        client_id: Optional[Any],
+        hostname: str,
+        port: int,
+        decision: dict[str, Any],
+    ) -> None:
+        cache_key = self._cache_key(client_id, hostname, port)
+        if cache_key is None:
+            return
+
+        self._prune_connect_decisions()
+        cached = dict(decision)
+        cached["expiresAt"] = time.time() + CONNECT_DECISION_TTL_SECONDS
+        self._connect_decisions[cache_key] = cached
+
+    def _get_connect_decision(
+        self, client_id: Optional[Any], hostname: str, port: int
+    ) -> Optional[dict[str, Any]]:
+        cache_key = self._cache_key(client_id, hostname, port)
+        if cache_key is None:
+            return None
+
+        self._prune_connect_decisions()
+        decision = self._connect_decisions.get(cache_key)
+        if not decision:
+            return None
+        return dict(decision)
+
+    def _strip_proxy_authorization(self, headers: Any) -> None:
+        for header_name in list(headers.keys()):
+            if header_name.lower() == "proxy-authorization":
+                del headers[header_name]
+
+    def _profile_log_suffix(self, aws_profile: Optional[str]) -> str:
+        if not aws_profile:
+            return ""
+        return f' awsProfile="{aws_profile}"'
 
     # -- config hot-reload --------------------------------------------------
 
@@ -316,18 +595,36 @@ class CodexProxy:
     def http_connect(self, flow: http.HTTPFlow) -> None:
         hostname = flow.request.host
         port = flow.request.port
-        decision = evaluate_connect(hostname, port, self.config)
+        headers = {k.lower(): v for k, v in flow.request.headers.items()}
+        aws_profile = extract_aws_profile_from_proxy_auth(headers, self.config)
+        decision = evaluate_connect(
+            hostname,
+            port,
+            self.config,
+            aws_profile=aws_profile,
+        )
+        decision["awsProfile"] = aws_profile
+        self._store_connect_decision(
+            getattr(flow.client_conn, "id", None),
+            hostname,
+            port,
+            decision,
+        )
+        self._strip_proxy_authorization(flow.request.headers)
+        profile_suffix = self._profile_log_suffix(aws_profile)
 
         if not decision["allowed"]:
             ctx.log.warn(
-                f'[blocked] CONNECT {hostname}:{port} reason="{decision["reason"]}"'
+                f'[blocked] CONNECT {hostname}:{port}{profile_suffix} '
+                f'reason="{decision["reason"]}"'
             )
             flow.response = http.Response.make(403, b"Forbidden\n")
             return
 
         action = decision.get("action", "mitm")
         ctx.log.info(
-            f'[{action}] CONNECT {hostname}:{port} reason="{decision["reason"]}"'
+            f'[{action}] CONNECT {hostname}:{port}{profile_suffix} '
+            f'reason="{decision["reason"]}"'
         )
 
     # -- TLS passthrough decision -------------------------------------------
@@ -337,7 +634,11 @@ class CodexProxy:
         if not server:
             return
         hostname, port = server[0], server[1]
-        decision = evaluate_connect(hostname, port, self.config)
+        client = getattr(data.context, "client", None)
+        client_id = getattr(client, "id", None)
+        decision = self._get_connect_decision(client_id, hostname, port)
+        if decision is None:
+            decision = evaluate_connect(hostname, port, self.config)
         if decision.get("allowed") and decision.get("action") == "passthrough":
             data.ignore_connection = True
 
@@ -347,6 +648,16 @@ class CodexProxy:
         scheme = flow.request.scheme
         is_ws = flow.request.headers.get("upgrade", "").lower() == "websocket"
         protocol = ("wss" if scheme == "https" else "ws") if is_ws else scheme
+        headers = {k.lower(): v for k, v in flow.request.headers.items()}
+        aws_profile = extract_aws_profile_from_proxy_auth(headers, self.config)
+        cached_decision = self._get_connect_decision(
+            getattr(flow.client_conn, "id", None),
+            flow.request.host,
+            flow.request.port,
+        )
+        if aws_profile is None and cached_decision:
+            aws_profile = cached_decision.get("awsProfile")
+        self._strip_proxy_authorization(flow.request.headers)
 
         request_meta: dict[str, Any] = {
             "method": flow.request.method,
@@ -356,16 +667,24 @@ class CodexProxy:
             "path": flow.request.path,
             "url": flow.request.url,
             "userAgent": flow.request.headers.get("user-agent", ""),
-            "headers": {k.lower(): v for k, v in flow.request.headers.items()},
+            "headers": {
+                k.lower(): v for k, v in flow.request.headers.items()
+            },
         }
 
-        decision = evaluate_request(request_meta, self.config)
+        decision = evaluate_request(
+            request_meta,
+            self.config,
+            aws_profile=aws_profile,
+        )
+        profile_suffix = self._profile_log_suffix(aws_profile)
 
         if not decision["allowed"]:
             ua = request_meta["userAgent"]
             ctx.log.warn(
                 f'[blocked] {request_meta["method"]} {request_meta["url"]}'
-                f' userAgent="{ua}" reason="{decision["reason"]}"'
+                f'{profile_suffix} userAgent="{ua}" '
+                f'reason="{decision["reason"]}"'
             )
             body = json.dumps(
                 {
@@ -386,8 +705,11 @@ class CodexProxy:
 
         ctx.log.info(
             f'[allowed] {request_meta["method"]} {request_meta["url"]}'
-            f' reason="{decision["reason"]}"'
+            f'{profile_suffix} reason="{decision["reason"]}"'
         )
+
+    def client_disconnected(self, client: Any) -> None:
+        self._prune_connect_decisions(getattr(client, "id", None))
 
 
 addons = [CodexProxy()]

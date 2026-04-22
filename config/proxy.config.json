@@ -17,12 +17,31 @@
       "chatgpt.com",
       "auth.openai.com",
       "mcp.linear.app",
-      "api.github.com"
+      "github.com",
+      "*.github.com",
+      "*.githubusercontent.com"
     ]
   },
   "requestFiltering": {
     "inspectFallbackAllowedMethods": ["GET"],
     "allowRules": [
     ]
+  },
+  "aws": {
+    "enabled": true,
+    "profileSelector": {
+      "type": "proxyBasicAuth",
+      "username": "aws"
+    },
+    "profilePassthrough": {
+      "profiles": [],
+      "hostPatterns": [
+        "*.amazonaws.com",
+        "*.amazonaws.com.cn",
+        "*.api.aws",
+        "*.signin.aws.amazon.com"
+      ],
+      "onMissingProfile": "inspect"
+    }
   }
 }

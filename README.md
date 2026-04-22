@@ -81,6 +81,7 @@ cd ~/codex-proxy/mitmproxy-proxy
 - `tls.passthroughHosts`: CA なしで素通しする host
 - `requestFiltering.inspectFallbackAllowedMethods`: 未知 host を inspect したときの既定許可 method
 - `requestFiltering.allowRules`: inspect 済み request の allow ルール。`hosts` に書いた host は自動で inspect 対象になる
+- `aws`: AWS profile selector を使った passthrough 設定
 
 重要:
 
@@ -88,3 +89,38 @@ cd ~/codex-proxy/mitmproxy-proxy
 - `tls.passthroughHosts` にも同じ host を書いた場合は passthrough が優先です
 - `requestFiltering.allowRules[].hosts` に一致する host では fallback より rule が優先です
 - AWS SSO のように CA なしで通したいものは `tls.passthroughHosts` に入れます
+
+## AWS profile passthrough
+
+特定の AWS profile だけ AWS host を MITM せず素通ししたいときは、`aws.profilePassthrough.profiles` に profile 名を入れます。
+
+```json
+{
+  "aws": {
+    "enabled": true,
+    "profileSelector": {
+      "type": "proxyBasicAuth",
+      "username": "aws"
+    },
+    "profilePassthrough": {
+      "profiles": ["prod-admin", "breakglass"],
+      "onMissingProfile": "inspect"
+    }
+  }
+}
+```
+
+クライアント側では `Proxy-Authorization` に selector を載せるため、proxy URL を次の形で使います。
+
+```bash
+export HTTPS_PROXY=http://aws:${AWS_PROFILE}@127.0.0.1:8787
+export HTTP_PROXY="$HTTPS_PROXY"
+```
+
+このとき:
+
+- username が `aws` の Basic auth だけ selector として扱います
+- password 部分を AWS profile 名として読みます
+- `profiles` に一致した AWS host は passthrough されます
+- それ以外の profile は既存の inspect / allowRules / fallback に流れます
+- `onMissingProfile` を `block` にすると、selector がない AWS host を拒否できます

@@ -75,6 +75,12 @@ class AddonTests(unittest.TestCase):
         self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
         return addon.load_config(path)
 
+    def _load_repo_config(self) -> dict:
+        config_path = (
+            Path(__file__).resolve().parents[1] / "config" / "proxy.config.json"
+        )
+        return addon.load_config(str(config_path))
+
     def test_load_config_applies_conditional_passthrough_defaults(self) -> None:
         config = self._load_config(
             {
@@ -322,6 +328,62 @@ class AddonTests(unittest.TestCase):
         self.assertEqual(github_uploads["action"], "passthrough")
         self.assertTrue(githubusercontent["allowed"])
         self.assertEqual(githubusercontent["action"], "passthrough")
+
+    def test_repo_proxy_config_passthrough_hosts_are_effective(self) -> None:
+        config = self._load_repo_config()
+
+        openai = addon.evaluate_connect("api.openai.com", 443, config)
+        github_assets = addon.evaluate_connect(
+            "objects.githubusercontent.com", 443, config
+        )
+
+        self.assertTrue(openai["allowed"])
+        self.assertEqual(openai["action"], "passthrough")
+        self.assertTrue(github_assets["allowed"])
+        self.assertEqual(github_assets["action"], "passthrough")
+
+    def test_repo_proxy_config_aws_profile_passthrough_is_effective(self) -> None:
+        config = self._load_repo_config()
+
+        selected_profile = addon.evaluate_connect(
+            "eks.ap-northeast-1.amazonaws.com",
+            443,
+            config,
+            proxy_basic_auth={"username": "aws", "password": "prod-admin"},
+        )
+        other_profile = addon.evaluate_connect(
+            "eks.ap-northeast-1.amazonaws.com",
+            443,
+            config,
+            proxy_basic_auth={"username": "aws", "password": "dev"},
+        )
+
+        self.assertTrue(selected_profile["allowed"])
+        self.assertEqual(selected_profile["action"], "passthrough")
+        self.assertEqual(selected_profile["matchedRuleName"], "aws-profile")
+        self.assertTrue(other_profile["allowed"])
+        self.assertEqual(other_profile["action"], "mitm")
+
+    def test_repo_proxy_config_aws_non_get_request_without_selector_is_blocked(
+        self,
+    ) -> None:
+        config = self._load_repo_config()
+
+        decision = addon.evaluate_request(
+            {
+                "method": "POST",
+                "protocol": "https",
+                "hostname": "eks.ap-northeast-1.amazonaws.com",
+                "port": 443,
+                "path": "/clusters",
+                "url": "https://eks.ap-northeast-1.amazonaws.com/clusters",
+                "userAgent": "aws-cli",
+                "headers": {},
+            },
+            config,
+        )
+
+        self.assertFalse(decision["allowed"])
 
 
 if __name__ == "__main__":

@@ -39,7 +39,7 @@
       "selector": {
         "type": "proxyBasicAuth",
         "username": "aws",
-        "allowedPasswords": ["ensou-stg"]
+        "allowedPasswords": ["prod-*"]
       },
       "onMissingSelector": "inspect"
     }

@@ -1,52 +1,85 @@
 # mitmproxy-proxy
 
-`mitmproxy` に一本化したローカル proxy です。CA は `mitmproxy` 標準の `~/.mitmproxy` を使います。
+AI Agent や CLI ツールの外部通信を、ローカルで観測・制御するための `mitmproxy` addon です。
 
-新しく入る人向けの詳細は [ONBOARDING.md](/home/yanto/codex-proxy/mitmproxy-proxy/ONBOARDING.md) にまとめています。
+HTTP/HTTPS proxy として動かし、通信先や request 内容に応じて次のように扱います。
 
-## ポイント
+- `passthrough`: TLS を MITM せず、そのまま通す
+- `inspect`: HTTPS を MITM して request rule を評価する
+- `block`: 許可していない通信を拒否する
 
-- CA は `mitmproxy` が初回起動時に `~/.mitmproxy/` に生成
-- `allowRules[].hosts` に入った host は自動で `inspect` される
-- host ごとの証明書登録は不要
-- `tls.passthroughHosts` は CA 不要
-- `requestFiltering.allowRules[].hosts` は CA 必要
+AI Agent に外部通信を許しつつ、「どこへ出ているか分かる」「必要な通信だけ通す」「MITM すると壊れる endpoint は触らない」という運用をするための小さなローカル proxy です。
 
-## 1回だけやること
+## できること
 
-まず `mitmdump` を 1 回起動して CA を生成します。
+- `mitmproxy` / `mitmdump` 上で動く
+- JSON config で通信ルールを書ける
+- host / method / path / header で inspected request を allow できる
+- MITM したくない host を TLS passthrough できる
+- 未知 host の fallback 許可 method を指定できる
+- Proxy Basic auth を selector として使い、条件付き passthrough できる
+- config を hot reload する
+- 設定が効いているかを unit test で確認できる
+
+## セットアップ
+
+依存を入れます。
 
 ```bash
-cd ~/codex-proxy/mitmproxy-proxy
+python3 -m pip install -r requirements.txt
+```
+
+proxy を起動します。
+
+```bash
 ./start.sh
 ```
 
-そのあと Ubuntu / WSL では次を実行します。
+デフォルトでは `127.0.0.1:8787` で待ち受けます。
+
+別 shell で、使いたい command に proxy を向けます。
 
 ```bash
-cd ~/codex-proxy/mitmproxy-proxy
+export HTTP_PROXY=http://127.0.0.1:8787
+export HTTPS_PROXY=http://127.0.0.1:8787
+
+curl https://example.com
+```
+
+background で起動する場合:
+
+```bash
+./background.sh
+```
+
+## HTTPS inspect と CA
+
+`inspect` する HTTPS 通信では、`mitmproxy` が接続先 host 用の証明書を動的に発行します。そのため、client 側が `mitmproxy` の CA を信頼している必要があります。
+
+CA は `mitmdump` 初回起動時に `~/.mitmproxy/` に作られます。
+
+Ubuntu / WSL では次で system trust store に登録できます。
+
+```bash
 ./install-ca.sh
 ```
 
-中でやっていることはこれです。
+中では概ね次を実行しています。
 
 ```bash
 sudo cp ~/.mitmproxy/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/mitmproxy.crt
 sudo update-ca-certificates
 ```
 
-これでこの `mitmproxy` CA がシステムで信頼されます。`mitmproxy` がその CA で発行する `localhost` や任意 host の証明書も同じ trust chain で通ります。
+一部の tool は system trust store を見ません。その場合は個別に CA を指定します。
 
-注意:
+```bash
+export SSL_CERT_FILE="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+export REQUESTS_CA_BUNDLE="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+export NODE_EXTRA_CA_CERTS="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+```
 
-- `~/.mitmproxy` を消して CA が再生成されたら、再登録が必要
-- 一部ツールは system CA を見ないので、その場合は個別に `SSL_CERT_FILE` や `AWS_CA_BUNDLE` が必要
-
-AWS CLI v2 について:
-
-- `update-ca-certificates` をしていても、AWS CLI v2 は system trust store ではなく自前の CA bundle を使うことがあります
-- その場合、proxy 経由の `aws eks list-clusters` は `CERTIFICATE_VERIFY_FAILED` で落ちます
-- いちばん安定するのは `~/.aws/config` の `[default]` に `ca_bundle = /etc/ssl/certs/ca-certificates.crt` を入れるやり方です
+AWS CLI v2 では `~/.aws/config` に `ca_bundle` を書くほうが安定することがあります。
 
 ```ini
 [default]
@@ -54,46 +87,118 @@ region = ap-northeast-1
 ca_bundle = /etc/ssl/certs/ca-certificates.crt
 ```
 
-注意:
+## 設定ファイル
 
-- `ca_bundle` は `[default]` セクションに入れる
-- パスは `.crt` まで含めて正確に書く
-- `.cr` などにすると効かず、proxy 経由だけ unknown ca になります
+設定は [config/proxy.config.json](config/proxy.config.json) に書きます。
 
-## 起動
+最小構成はこのような形です。
 
-```bash
-cd ~/codex-proxy/mitmproxy-proxy
-./start.sh
+```json
+{
+  "host": "127.0.0.1",
+  "port": 8787,
+  "tls": {
+    "passthroughHosts": ["api.openai.com", "github.com", "*.github.com"]
+  },
+  "requestFiltering": {
+    "inspectFallbackAllowedMethods": ["GET"],
+    "allowRules": []
+  },
+  "conditionalPassthrough": []
+}
 ```
 
-バックグラウンド起動:
+### `tls.passthroughHosts`
 
-```bash
-cd ~/codex-proxy/mitmproxy-proxy
-./background.sh
+ここに入れた host は MITM せず、そのまま通します。
+
+認証系 endpoint、package registry、MITM する必要がない API などを入れます。
+
+```json
+{
+  "tls": {
+    "passthroughHosts": [
+      "api.openai.com",
+      "auth.openai.com",
+      "github.com",
+      "*.github.com",
+      "*.githubusercontent.com"
+    ]
+  }
+}
 ```
 
-## config の意味
+### `requestFiltering.allowRules`
 
-設定ファイルは [config/proxy.config.json](/home/yanto/codex-proxy/mitmproxy-proxy/config/proxy.config.json) です。
+MITM して inspect した request に対する allow rule です。
 
-- `tls.passthroughHosts`: CA なしで素通しする host
-- `requestFiltering.inspectFallbackAllowedMethods`: 未知 host を inspect したときの既定許可 method
-- `requestFiltering.allowRules`: inspect 済み request の allow ルール。`hosts` に書いた host は自動で inspect 対象になる
-- `conditionalPassthrough`: proxy selector を使った条件付き passthrough 設定
+`allowRules[].hosts` に書いた host は inspect 対象になります。その host への request は、allow rule に一致したものだけ通ります。
 
-重要:
+```json
+{
+  "requestFiltering": {
+    "allowRules": [
+      {
+        "name": "aws eks list clusters",
+        "methods": ["GET"],
+        "protocols": ["https"],
+        "hosts": ["eks.ap-northeast-1.amazonaws.com"],
+        "pathPatterns": ["/clusters*"]
+      }
+    ]
+  }
+}
+```
 
-- `requestFiltering.allowRules[].hosts` に書いた host は自動で MITM されます
-- `tls.passthroughHosts` にも同じ host を書いた場合は passthrough が優先です
-- `requestFiltering.allowRules[].hosts` に一致する host では fallback より rule が優先です
-- AWS SSO のように CA なしで通したいものは `tls.passthroughHosts` に入れます
+主な match field:
 
-## Conditional passthrough
+- `methods`
+- `protocols`
+- `hosts`
+- `ports`
+- `pathPatterns`
+- `urlPatterns`
+- `userAgents`
+- `headerPatterns`
 
-特定の selector だけ対象 host を MITM せず素通ししたいときは、`conditionalPassthrough` を使います。
-AWS profile を selector にする場合は、proxy URL の Basic auth password 部分に profile 名を載せます。
+文字列の pattern では `*`、`**`、`?` が使えます。
+
+### `requestFiltering.inspectFallbackAllowedMethods`
+
+`passthroughHosts` にも `allowRules` にもない unknown host の fallback です。
+
+```json
+{
+  "requestFiltering": {
+    "inspectFallbackAllowedMethods": ["GET"]
+  }
+}
+```
+
+`["GET"]` なら unknown host は inspect され、GET だけ通ります。
+
+より厳しくするなら空配列にします。
+
+```json
+{
+  "requestFiltering": {
+    "inspectFallbackAllowedMethods": []
+  }
+}
+```
+
+### `conditionalPassthrough`
+
+client 側の文脈に応じて passthrough したいときに使います。
+
+例として、proxy は `AWS_PROFILE` を直接見られません。そこで Proxy Basic auth の password 部分を selector として使います。
+
+```bash
+export HTTPS_PROXY=http://aws:${AWS_PROFILE}@127.0.0.1:8787
+export HTTP_PROXY="$HTTPS_PROXY"
+```
+
+設定例:
 
 ```json
 {
@@ -109,7 +214,7 @@ AWS profile を selector にする場合は、proxy URL の Basic auth password 
       "selector": {
         "type": "proxyBasicAuth",
         "username": "aws",
-        "allowedPasswords": ["prod-admin", "breakglass"]
+        "allowedPasswords": ["prod-*", "breakglass"]
       },
       "onMissingSelector": "inspect"
     }
@@ -117,18 +222,52 @@ AWS profile を selector にする場合は、proxy URL の Basic auth password 
 }
 ```
 
-クライアント側では `Proxy-Authorization` に selector を載せるため、proxy URL を次の形で使います。
+この場合:
+
+- `username` が `aws` の Basic auth だけ selector として扱う
+- password 部分を local selector value として扱う
+- `allowedPasswords` に一致した host は passthrough する
+- 一致しない場合は通常の inspect / allowRules / fallback に流す
+- `Proxy-Authorization` は upstream に流す前に削除する
+
+これは本格的な proxy 認証ではなく、ローカル proxy に対する routing hint です。
+
+## 判定順
+
+HTTPS CONNECT では次の順で判定します。
+
+1. `tls.passthroughHosts` に一致したら `passthrough`
+2. `conditionalPassthrough` に一致したら `passthrough`
+3. `allowRules[].hosts` に一致したら `inspect`
+4. `inspectFallbackAllowedMethods` が空でなければ `inspect`
+5. それ以外は `block`
+
+inspect された HTTP request は次の順で判定します。
+
+1. passthrough host は allow
+2. conditional passthrough に一致したら allow
+3. allow rule に一致したら allow
+4. 明示 rule のない host では fallback method を allow
+5. それ以外は block
+
+`tls.passthroughHosts` が最優先です。MITM すると壊れる host はここに入れておくのが基本です。
+
+## テスト
 
 ```bash
-export HTTPS_PROXY=http://aws:${AWS_PROFILE}@127.0.0.1:8787
-export HTTP_PROXY="$HTTPS_PROXY"
+python3 -m unittest -v
 ```
 
-このとき:
+config 読み込み、rule 評価、conditional passthrough、実際の `config/proxy.config.json` の挙動をテストしています。
 
-- username が `aws` の Basic auth だけ selector として扱います
-- password 部分を AWS profile 名として読みます
-- `allowedPasswords` に一致した AWS host は passthrough されます
-- それ以外の profile は既存の inspect / allowRules / fallback に流れます
-- `allowedPasswords` は glob として評価されるので、`prod-*` や `*admin*` も使えます
-- `onMissingSelector` を `block` にすると、selector がない対象 host を拒否できます
+## 注意
+
+これはローカル開発用の proxy であり、完全な network sandbox ではありません。
+
+この proxy を通るように設定された通信は観測・制御できますが、process が別経路で通信できる環境では、この proxy だけで外部通信を完全に防ぐことはできません。必要なら OS、container、firewall、sandbox などと組み合わせてください。
+
+また、`~/.mitmproxy/mitmproxy-ca.pem` には CA の秘密鍵が含まれます。公開したり共有したりしないでください。
+
+## 関連
+
+- [zenn-agent-proxy.md](zenn-agent-proxy.md): Zenn 記事の下書き

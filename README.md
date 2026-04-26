@@ -81,7 +81,7 @@ cd ~/codex-proxy/mitmproxy-proxy
 - `tls.passthroughHosts`: CA なしで素通しする host
 - `requestFiltering.inspectFallbackAllowedMethods`: 未知 host を inspect したときの既定許可 method
 - `requestFiltering.allowRules`: inspect 済み request の allow ルール。`hosts` に書いた host は自動で inspect 対象になる
-- `aws`: AWS profile selector を使った passthrough 設定
+- `conditionalPassthrough`: proxy selector を使った条件付き passthrough 設定
 
 重要:
 
@@ -90,23 +90,30 @@ cd ~/codex-proxy/mitmproxy-proxy
 - `requestFiltering.allowRules[].hosts` に一致する host では fallback より rule が優先です
 - AWS SSO のように CA なしで通したいものは `tls.passthroughHosts` に入れます
 
-## AWS profile passthrough
+## Conditional passthrough
 
-特定の AWS profile だけ AWS host を MITM せず素通ししたいときは、`aws.profilePassthrough.profiles` に profile 名を入れます。
+特定の selector だけ対象 host を MITM せず素通ししたいときは、`conditionalPassthrough` を使います。
+AWS profile を selector にする場合は、proxy URL の Basic auth password 部分に profile 名を載せます。
 
 ```json
 {
-  "aws": {
-    "enabled": true,
-    "profileSelector": {
-      "type": "proxyBasicAuth",
-      "username": "aws"
-    },
-    "profilePassthrough": {
-      "profiles": ["prod-admin", "breakglass"],
-      "onMissingProfile": "inspect"
+  "conditionalPassthrough": [
+    {
+      "name": "aws-profile",
+      "hostPatterns": [
+        "*.amazonaws.com",
+        "*.amazonaws.com.cn",
+        "*.api.aws",
+        "*.signin.aws.amazon.com"
+      ],
+      "selector": {
+        "type": "proxyBasicAuth",
+        "username": "aws",
+        "allowedPasswords": ["prod-admin", "breakglass"]
+      },
+      "onMissingSelector": "inspect"
     }
-  }
+  ]
 }
 ```
 
@@ -121,6 +128,7 @@ export HTTP_PROXY="$HTTPS_PROXY"
 
 - username が `aws` の Basic auth だけ selector として扱います
 - password 部分を AWS profile 名として読みます
-- `profiles` に一致した AWS host は passthrough されます
+- `allowedPasswords` に一致した AWS host は passthrough されます
 - それ以外の profile は既存の inspect / allowRules / fallback に流れます
-- `onMissingProfile` を `block` にすると、selector がない AWS host を拒否できます
+- `allowedPasswords` は glob として評価されるので、`prod-*` や `*admin*` も使えます
+- `onMissingSelector` を `block` にすると、selector がない対象 host を拒否できます

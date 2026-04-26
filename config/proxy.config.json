@@ -27,21 +27,21 @@
     "allowRules": [
     ]
   },
-  "aws": {
-    "enabled": true,
-    "profileSelector": {
-      "type": "proxyBasicAuth",
-      "username": "aws"
-    },
-    "profilePassthrough": {
-      "profiles": [],
+  "conditionalPassthrough": [
+    {
+      "name": "aws-profile",
       "hostPatterns": [
         "*.amazonaws.com",
         "*.amazonaws.com.cn",
         "*.api.aws",
         "*.signin.aws.amazon.com"
       ],
-      "onMissingProfile": "inspect"
+      "selector": {
+        "type": "proxyBasicAuth",
+        "username": "aws",
+        "allowedPasswords": ["ensou-stg"]
+      },
+      "onMissingSelector": "inspect"
     }
-  }
+  ]
 }

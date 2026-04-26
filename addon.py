@@ -21,12 +21,6 @@ from mitmproxy import ctx, http, tls
 # ---------------------------------------------------------------------------
 
 _ESCAPE_RE = re.compile(r"([|\\{}()\[\]^$+?.])")
-DEFAULT_AWS_HOST_PATTERNS = [
-    "*.amazonaws.com",
-    "*.amazonaws.com.cn",
-    "*.api.aws",
-    "*.signin.aws.amazon.com",
-]
 CONNECT_DECISION_TTL_SECONDS = 30
 
 
@@ -121,17 +115,6 @@ def get_optional_string(
     return value
 
 
-def get_optional_bool(
-    record: dict[str, Any], key: str, label: str
-) -> Optional[bool]:
-    value = record.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, bool):
-        raise ValueError(f"{label} must be a boolean")
-    return value
-
-
 def validate_enum(
     value: str, label: str, allowed: list[str]
 ) -> None:
@@ -190,7 +173,7 @@ def host_has_explicit_rules(hostname: str, config: dict[str, Any]) -> bool:
 def evaluate_request(
     request: dict[str, Any],
     config: dict[str, Any],
-    aws_profile: Optional[str] = None,
+    proxy_basic_auth: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     method = request["method"].upper()
     default_methods = [
@@ -206,17 +189,11 @@ def evaluate_request(
             "reason": f"passthrough host: {request['hostname']}",
         }
 
-    aws_decision = evaluate_aws_profile_passthrough(
-        request["hostname"], config, aws_profile
+    passthrough_decision = evaluate_conditional_passthrough(
+        request["hostname"], config, proxy_basic_auth
     )
-    if aws_decision:
-        if aws_decision["allowed"]:
-            return {
-                "allowed": True,
-                "reason": aws_decision["reason"],
-                "awsProfile": aws_profile,
-            }
-        return aws_decision
+    if passthrough_decision:
+        return passthrough_decision
 
     if host_has_explicit_rules(request["hostname"], config):
         for rule in config["requestFiltering"]["allowRules"]:
@@ -236,7 +213,7 @@ def evaluate_connect(
     hostname: str,
     port: int,
     config: dict[str, Any],
-    aws_profile: Optional[str] = None,
+    proxy_basic_auth: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     if config["tls"]["passthroughHosts"] and matches_globs(
         hostname, config["tls"]["passthroughHosts"]
@@ -247,18 +224,13 @@ def evaluate_connect(
             "reason": f"passthrough host: {hostname}",
         }
 
-    aws_decision = evaluate_aws_profile_passthrough(
-        hostname, config, aws_profile
+    passthrough_decision = evaluate_conditional_passthrough(
+        hostname, config, proxy_basic_auth
     )
-    if aws_decision:
-        if aws_decision["allowed"]:
-            return {
-                "allowed": True,
-                "action": "passthrough",
-                "reason": aws_decision["reason"],
-                "awsProfile": aws_profile,
-            }
-        return aws_decision
+    if passthrough_decision:
+        if passthrough_decision["allowed"]:
+            passthrough_decision["action"] = "passthrough"
+        return passthrough_decision
 
     matched_rule = find_inspect_rule_for_host(hostname, config)
     if matched_rule:
@@ -278,50 +250,50 @@ def evaluate_connect(
     return {"allowed": False, "reason": f"blocked CONNECT {hostname}:{port}"}
 
 
-def is_aws_host(hostname: str, config: dict[str, Any]) -> bool:
-    aws_config = config.get("aws", {})
-    if not aws_config.get("enabled"):
-        return False
-    return matches_globs(
-        hostname, aws_config["profilePassthrough"]["hostPatterns"]
-    )
-
-
-def evaluate_aws_profile_passthrough(
+def evaluate_conditional_passthrough(
     hostname: str,
     config: dict[str, Any],
-    aws_profile: Optional[str],
+    proxy_basic_auth: Optional[dict[str, str]],
 ) -> Optional[dict[str, Any]]:
-    if not is_aws_host(hostname, config):
+    missing_selector_block: Optional[dict[str, Any]] = None
+    selected_any_rule = False
+    for rule in config["conditionalPassthrough"]:
+        if not matches_globs(hostname, rule["hostPatterns"]):
+            continue
+
+        selector = rule["selector"]
+        if selector["type"] == "proxyBasicAuth":
+            selected = (
+                proxy_basic_auth is not None
+                and proxy_basic_auth["username"] == selector["username"]
+            )
+            if not selected:
+                if rule["onMissingSelector"] == "block":
+                    missing_selector_block = {
+                        "allowed": False,
+                        "reason": (
+                            "blocked conditional passthrough host without "
+                            f"selector: {hostname} rule: {rule['name']}"
+                        ),
+                    }
+                continue
+
+            selected_any_rule = True
+            if matches_globs(
+                proxy_basic_auth["password"],
+                selector["allowedPasswords"],
+            ):
+                return {
+                    "allowed": True,
+                    "reason": f"conditional passthrough: {rule['name']}",
+                    "matchedRuleName": rule["name"],
+                }
+    if selected_any_rule:
         return None
-
-    passthrough = config["aws"]["profilePassthrough"]
-    if aws_profile is None:
-        if passthrough["onMissingProfile"] == "block":
-            return {
-                "allowed": False,
-                "reason": (
-                    f"blocked AWS host without profile selector: {hostname}"
-                ),
-            }
-        return None
-
-    if aws_profile in passthrough["profiles"]:
-        return {
-            "allowed": True,
-            "reason": f"aws profile passthrough: {aws_profile}",
-            "awsProfile": aws_profile,
-        }
-
-    return None
+    return missing_selector_block
 
 
-def extract_aws_profile_from_proxy_auth(
-    headers: dict[str, str], config: dict[str, Any]
-) -> Optional[str]:
-    if not config.get("aws", {}).get("enabled"):
-        return None
-
+def extract_proxy_basic_auth(headers: dict[str, str]) -> Optional[dict[str, str]]:
     raw = headers.get("proxy-authorization")
     if not raw:
         return None
@@ -336,14 +308,10 @@ def extract_aws_profile_from_proxy_auth(
         return None
 
     username, separator, password = decoded.partition(":")
-    if (
-        separator != ":"
-        or username != config["aws"]["profileSelector"]["username"]
-        or not password
-    ):
+    if separator != ":" or not username or not password:
         return None
 
-    return password
+    return {"username": username, "password": password}
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +335,7 @@ def load_config(config_path: str) -> dict[str, Any]:
             "suppressTlsClientErrors",
             "tls",
             "requestFiltering",
-            "aws",
+            "conditionalPassthrough",
         ],
     )
 
@@ -375,17 +343,9 @@ def load_config(config_path: str) -> dict[str, Any]:
     request_filtering = (
         get_optional_object(raw.get("requestFiltering"), "requestFiltering") or {}
     )
-    aws = get_optional_object(raw.get("aws"), "aws") or {}
-    profile_selector = (
-        get_optional_object(aws.get("profileSelector"), "aws.profileSelector")
-        or {}
-    )
-    profile_passthrough = (
-        get_optional_object(
-            aws.get("profilePassthrough"), "aws.profilePassthrough"
-        )
-        or {}
-    )
+    conditional_passthrough = raw.get("conditionalPassthrough", [])
+    if not isinstance(conditional_passthrough, list):
+        raise ValueError("conditionalPassthrough must be an array")
 
     validate_keys(tls, "tls", ["passthroughHosts"])
     validate_keys(
@@ -393,45 +353,91 @@ def load_config(config_path: str) -> dict[str, Any]:
         "requestFiltering",
         ["inspectFallbackAllowedMethods", "allowRules"],
     )
-    validate_keys(aws, "aws", ["enabled", "profileSelector", "profilePassthrough"])
-    validate_keys(
-        profile_selector,
-        "aws.profileSelector",
-        ["type", "username"],
-    )
-    validate_keys(
-        profile_passthrough,
-        "aws.profilePassthrough",
-        ["profiles", "hostPatterns", "onMissingProfile"],
-    )
-
     allow_rules = request_filtering.get("allowRules", [])
     if not isinstance(allow_rules, list):
         raise ValueError("requestFiltering.allowRules must be an array")
 
-    aws_enabled = get_optional_bool(aws, "enabled", "aws.enabled")
-    profile_selector_type = get_optional_string(
-        profile_selector,
-        "type",
-        "aws.profileSelector.type",
-    )
-    if profile_selector_type is not None:
-        validate_enum(
-            profile_selector_type,
-            "aws.profileSelector.type",
-            ["proxyBasicAuth"],
+    passthrough_rules: list[dict[str, Any]] = []
+    for index, item in enumerate(conditional_passthrough):
+        label = f"conditionalPassthrough[{index}]"
+        rule = get_optional_object(item, label)
+        if rule is None:
+            raise ValueError(f"{label} must be an object")
+        validate_keys(
+            rule,
+            label,
+            ["name", "hostPatterns", "selector", "onMissingSelector"],
         )
 
-    on_missing_profile = get_optional_string(
-        profile_passthrough,
-        "onMissingProfile",
-        "aws.profilePassthrough.onMissingProfile",
-    )
-    if on_missing_profile is not None:
-        validate_enum(
-            on_missing_profile,
-            "aws.profilePassthrough.onMissingProfile",
-            ["inspect", "block"],
+        selector = get_optional_object(
+            rule.get("selector"), f"{label}.selector"
+        )
+        if selector is None:
+            raise ValueError(f"{label}.selector must be an object")
+        validate_keys(
+            selector,
+            f"{label}.selector",
+            ["type", "username", "allowedPasswords"],
+        )
+
+        selector_type = get_optional_string(
+            selector, "type", f"{label}.selector.type"
+        )
+        if selector_type is not None:
+            validate_enum(
+                selector_type,
+                f"{label}.selector.type",
+                ["proxyBasicAuth"],
+            )
+
+        on_missing_selector = get_optional_string(
+            rule,
+            "onMissingSelector",
+            f"{label}.onMissingSelector",
+        )
+        if on_missing_selector is not None:
+            validate_enum(
+                on_missing_selector,
+                f"{label}.onMissingSelector",
+                ["inspect", "block"],
+            )
+
+        name = get_optional_string(rule, "name", f"{label}.name")
+        host_patterns = get_optional_string_array(
+            rule,
+            "hostPatterns",
+            f"{label}.hostPatterns",
+        )
+        username = get_optional_string(
+            selector,
+            "username",
+            f"{label}.selector.username",
+        )
+        allowed_passwords = get_optional_string_array(
+            selector,
+            "allowedPasswords",
+            f"{label}.selector.allowedPasswords",
+        )
+        if not host_patterns:
+            raise ValueError(f"{label}.hostPatterns must not be empty")
+        if not username:
+            raise ValueError(f"{label}.selector.username must not be empty")
+        if not allowed_passwords:
+            raise ValueError(
+                f"{label}.selector.allowedPasswords must not be empty"
+            )
+
+        passthrough_rules.append(
+            {
+                "name": name or f"conditional-passthrough-{index + 1}",
+                "hostPatterns": host_patterns,
+                "selector": {
+                    "type": selector_type or "proxyBasicAuth",
+                    "username": username,
+                    "allowedPasswords": allowed_passwords,
+                },
+                "onMissingSelector": on_missing_selector or "inspect",
+            }
         )
 
     return {
@@ -457,37 +463,7 @@ def load_config(config_path: str) -> dict[str, Any]:
             ),
             "allowRules": allow_rules,
         },
-        "aws": {
-            "enabled": aws_enabled if aws_enabled is not None else False,
-            "profileSelector": {
-                "type": profile_selector_type or "proxyBasicAuth",
-                "username": get_optional_string(
-                    profile_selector,
-                    "username",
-                    "aws.profileSelector.username",
-                )
-                or "aws",
-            },
-            "profilePassthrough": {
-                "profiles": string_array_or_default(
-                    get_optional_string_array(
-                        profile_passthrough,
-                        "profiles",
-                        "aws.profilePassthrough.profiles",
-                    ),
-                    [],
-                ),
-                "hostPatterns": string_array_or_default(
-                    get_optional_string_array(
-                        profile_passthrough,
-                        "hostPatterns",
-                        "aws.profilePassthrough.hostPatterns",
-                    ),
-                    DEFAULT_AWS_HOST_PATTERNS,
-                ),
-                "onMissingProfile": on_missing_profile or "inspect",
-            },
-        },
+        "conditionalPassthrough": passthrough_rules,
     }
 
 
@@ -563,10 +539,12 @@ class CodexProxy:
             if header_name.lower() == "proxy-authorization":
                 del headers[header_name]
 
-    def _profile_log_suffix(self, aws_profile: Optional[str]) -> str:
-        if not aws_profile:
+    def _proxy_auth_log_suffix(
+        self, proxy_basic_auth: Optional[dict[str, str]]
+    ) -> str:
+        if not proxy_basic_auth:
             return ""
-        return f' awsProfile="{aws_profile}"'
+        return f' proxyAuthUser="{proxy_basic_auth["username"]}"'
 
     # -- config hot-reload --------------------------------------------------
 
@@ -596,14 +574,14 @@ class CodexProxy:
         hostname = flow.request.host
         port = flow.request.port
         headers = {k.lower(): v for k, v in flow.request.headers.items()}
-        aws_profile = extract_aws_profile_from_proxy_auth(headers, self.config)
+        proxy_basic_auth = extract_proxy_basic_auth(headers)
         decision = evaluate_connect(
             hostname,
             port,
             self.config,
-            aws_profile=aws_profile,
+            proxy_basic_auth=proxy_basic_auth,
         )
-        decision["awsProfile"] = aws_profile
+        decision["proxyBasicAuth"] = proxy_basic_auth
         self._store_connect_decision(
             getattr(flow.client_conn, "id", None),
             hostname,
@@ -611,11 +589,11 @@ class CodexProxy:
             decision,
         )
         self._strip_proxy_authorization(flow.request.headers)
-        profile_suffix = self._profile_log_suffix(aws_profile)
+        auth_suffix = self._proxy_auth_log_suffix(proxy_basic_auth)
 
         if not decision["allowed"]:
             ctx.log.warn(
-                f'[blocked] CONNECT {hostname}:{port}{profile_suffix} '
+                f'[blocked] CONNECT {hostname}:{port}{auth_suffix} '
                 f'reason="{decision["reason"]}"'
             )
             flow.response = http.Response.make(403, b"Forbidden\n")
@@ -623,7 +601,7 @@ class CodexProxy:
 
         action = decision.get("action", "mitm")
         ctx.log.info(
-            f'[{action}] CONNECT {hostname}:{port}{profile_suffix} '
+            f'[{action}] CONNECT {hostname}:{port}{auth_suffix} '
             f'reason="{decision["reason"]}"'
         )
 
@@ -649,14 +627,14 @@ class CodexProxy:
         is_ws = flow.request.headers.get("upgrade", "").lower() == "websocket"
         protocol = ("wss" if scheme == "https" else "ws") if is_ws else scheme
         headers = {k.lower(): v for k, v in flow.request.headers.items()}
-        aws_profile = extract_aws_profile_from_proxy_auth(headers, self.config)
+        proxy_basic_auth = extract_proxy_basic_auth(headers)
         cached_decision = self._get_connect_decision(
             getattr(flow.client_conn, "id", None),
             flow.request.host,
             flow.request.port,
         )
-        if aws_profile is None and cached_decision:
-            aws_profile = cached_decision.get("awsProfile")
+        if proxy_basic_auth is None and cached_decision:
+            proxy_basic_auth = cached_decision.get("proxyBasicAuth")
         self._strip_proxy_authorization(flow.request.headers)
 
         request_meta: dict[str, Any] = {
@@ -675,15 +653,15 @@ class CodexProxy:
         decision = evaluate_request(
             request_meta,
             self.config,
-            aws_profile=aws_profile,
+            proxy_basic_auth=proxy_basic_auth,
         )
-        profile_suffix = self._profile_log_suffix(aws_profile)
+        auth_suffix = self._proxy_auth_log_suffix(proxy_basic_auth)
 
         if not decision["allowed"]:
             ua = request_meta["userAgent"]
             ctx.log.warn(
                 f'[blocked] {request_meta["method"]} {request_meta["url"]}'
-                f'{profile_suffix} userAgent="{ua}" '
+                f'{auth_suffix} userAgent="{ua}" '
                 f'reason="{decision["reason"]}"'
             )
             body = json.dumps(
@@ -705,7 +683,7 @@ class CodexProxy:
 
         ctx.log.info(
             f'[allowed] {request_meta["method"]} {request_meta["url"]}'
-            f'{profile_suffix} reason="{decision["reason"]}"'
+            f'{auth_suffix} reason="{decision["reason"]}"'
         )
 
     def client_disconnected(self, client: Any) -> None:

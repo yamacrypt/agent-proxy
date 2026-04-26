@@ -75,7 +75,7 @@ class AddonTests(unittest.TestCase):
         self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
         return addon.load_config(path)
 
-    def test_load_config_applies_aws_defaults(self) -> None:
+    def test_load_config_applies_conditional_passthrough_defaults(self) -> None:
         config = self._load_config(
             {
                 "host": "127.0.0.1",
@@ -88,64 +88,55 @@ class AddonTests(unittest.TestCase):
             }
         )
 
-        self.assertFalse(config["aws"]["enabled"])
-        self.assertEqual(
-            config["aws"]["profileSelector"]["type"], "proxyBasicAuth"
-        )
-        self.assertEqual(config["aws"]["profileSelector"]["username"], "aws")
-        self.assertEqual(
-            config["aws"]["profilePassthrough"]["hostPatterns"],
-            [
-                "*.amazonaws.com",
-                "*.amazonaws.com.cn",
-                "*.api.aws",
-                "*.signin.aws.amazon.com",
-            ],
-        )
-        self.assertEqual(
-            config["aws"]["profilePassthrough"]["onMissingProfile"],
-            "inspect",
-        )
+        self.assertEqual(config["conditionalPassthrough"], [])
 
-    def test_extract_aws_profile_from_proxy_auth(self) -> None:
+    def test_load_config_normalizes_conditional_passthrough_rule(self) -> None:
         config = self._load_config(
             {
-                "aws": {
-                    "enabled": True,
-                    "profileSelector": {"username": "aws"},
-                    "profilePassthrough": {"profiles": ["prod-admin"]},
-                }
+                "conditionalPassthrough": [
+                    {
+                        "name": "aws-profile",
+                        "hostPatterns": ["*.amazonaws.com"],
+                        "selector": {
+                            "username": "aws",
+                            "allowedPasswords": ["prod-*"],
+                        },
+                    }
+                ]
             }
         )
+
+        rule = config["conditionalPassthrough"][0]
+        self.assertEqual(rule["name"], "aws-profile")
+        self.assertEqual(rule["hostPatterns"], ["*.amazonaws.com"])
+        self.assertEqual(rule["selector"]["type"], "proxyBasicAuth")
+        self.assertEqual(rule["selector"]["username"], "aws")
+        self.assertEqual(
+            rule["selector"]["allowedPasswords"],
+            ["prod-*"],
+        )
+        self.assertEqual(rule["onMissingSelector"], "inspect")
+
+    def test_extract_proxy_basic_auth(self) -> None:
         token = base64.b64encode(b"aws:prod-admin").decode("ascii")
 
-        profile = addon.extract_aws_profile_from_proxy_auth(
+        credentials = addon.extract_proxy_basic_auth(
             {"proxy-authorization": f"Basic {token}"},
-            config,
         )
 
-        self.assertEqual(profile, "prod-admin")
-
-    def test_extract_aws_profile_from_proxy_auth_ignores_other_username(self) -> None:
-        config = self._load_config(
-            {
-                "aws": {
-                    "enabled": True,
-                    "profileSelector": {"username": "aws"},
-                    "profilePassthrough": {"profiles": ["prod-admin"]},
-                }
-            }
-        )
-        token = base64.b64encode(b"user:prod-admin").decode("ascii")
-
-        profile = addon.extract_aws_profile_from_proxy_auth(
-            {"proxy-authorization": f"Basic {token}"},
-            config,
+        self.assertEqual(
+            credentials,
+            {"username": "aws", "password": "prod-admin"},
         )
 
-        self.assertIsNone(profile)
+    def test_extract_proxy_basic_auth_ignores_malformed_headers(self) -> None:
+        credentials = addon.extract_proxy_basic_auth(
+            {"proxy-authorization": "Basic not-valid-base64"},
+        )
 
-    def test_evaluate_connect_passthroughs_allowed_aws_profile(self) -> None:
+        self.assertIsNone(credentials)
+
+    def test_evaluate_connect_passthroughs_allowed_selector(self) -> None:
         config = self._load_config(
             {
                 "tls": {"passthroughHosts": []},
@@ -153,10 +144,17 @@ class AddonTests(unittest.TestCase):
                     "inspectFallbackAllowedMethods": [],
                     "allowRules": [],
                 },
-                "aws": {
-                    "enabled": True,
-                    "profilePassthrough": {"profiles": ["prod-admin"]},
-                },
+                "conditionalPassthrough": [
+                    {
+                        "name": "aws-profile",
+                        "hostPatterns": ["*.amazonaws.com"],
+                        "selector": {
+                            "type": "proxyBasicAuth",
+                            "username": "aws",
+                            "allowedPasswords": ["prod-*"],
+                        },
+                    }
+                ],
             }
         )
 
@@ -164,14 +162,14 @@ class AddonTests(unittest.TestCase):
             "eks.ap-northeast-1.amazonaws.com",
             443,
             config,
-            aws_profile="prod-admin",
+            proxy_basic_auth={"username": "aws", "password": "prod-admin"},
         )
 
         self.assertTrue(decision["allowed"])
         self.assertEqual(decision["action"], "passthrough")
-        self.assertEqual(decision["reason"], "aws profile passthrough: prod-admin")
+        self.assertEqual(decision["reason"], "conditional passthrough: aws-profile")
 
-    def test_evaluate_connect_blocks_missing_profile_when_configured(self) -> None:
+    def test_evaluate_connect_blocks_missing_selector_when_configured(self) -> None:
         config = self._load_config(
             {
                 "tls": {"passthroughHosts": []},
@@ -179,13 +177,18 @@ class AddonTests(unittest.TestCase):
                     "inspectFallbackAllowedMethods": ["GET"],
                     "allowRules": [],
                 },
-                "aws": {
-                    "enabled": True,
-                    "profilePassthrough": {
-                        "profiles": ["prod-admin"],
-                        "onMissingProfile": "block",
-                    },
-                },
+                "conditionalPassthrough": [
+                    {
+                        "name": "aws-profile",
+                        "hostPatterns": ["*.amazonaws.com"],
+                        "selector": {
+                            "type": "proxyBasicAuth",
+                            "username": "aws",
+                            "allowedPasswords": ["prod-admin"],
+                        },
+                        "onMissingSelector": "block",
+                    }
+                ],
             }
         )
 
@@ -196,9 +199,51 @@ class AddonTests(unittest.TestCase):
         )
 
         self.assertFalse(decision["allowed"])
-        self.assertIn("without profile selector", decision["reason"])
+        self.assertIn("without selector", decision["reason"])
 
-    def test_evaluate_request_falls_through_for_non_passthrough_profile(self) -> None:
+    def test_evaluate_connect_checks_later_matching_selector_before_blocking(self) -> None:
+        config = self._load_config(
+            {
+                "tls": {"passthroughHosts": []},
+                "requestFiltering": {
+                    "inspectFallbackAllowedMethods": [],
+                    "allowRules": [],
+                },
+                "conditionalPassthrough": [
+                    {
+                        "name": "other-selector",
+                        "hostPatterns": ["*.amazonaws.com"],
+                        "selector": {
+                            "type": "proxyBasicAuth",
+                            "username": "other",
+                            "allowedPasswords": ["prod-admin"],
+                        },
+                        "onMissingSelector": "block",
+                    },
+                    {
+                        "name": "aws-profile",
+                        "hostPatterns": ["*.amazonaws.com"],
+                        "selector": {
+                            "type": "proxyBasicAuth",
+                            "username": "aws",
+                            "allowedPasswords": ["prod-admin"],
+                        },
+                    },
+                ],
+            }
+        )
+
+        decision = addon.evaluate_connect(
+            "sts.ap-northeast-1.amazonaws.com",
+            443,
+            config,
+            proxy_basic_auth={"username": "aws", "password": "prod-admin"},
+        )
+
+        self.assertTrue(decision["allowed"])
+        self.assertEqual(decision["reason"], "conditional passthrough: aws-profile")
+
+    def test_evaluate_request_falls_through_for_non_passthrough_selector(self) -> None:
         config = self._load_config(
             {
                 "tls": {"passthroughHosts": []},
@@ -214,10 +259,17 @@ class AddonTests(unittest.TestCase):
                         }
                     ],
                 },
-                "aws": {
-                    "enabled": True,
-                    "profilePassthrough": {"profiles": ["prod-admin"]},
-                },
+                "conditionalPassthrough": [
+                    {
+                        "name": "aws-profile",
+                        "hostPatterns": ["*.amazonaws.com"],
+                        "selector": {
+                            "type": "proxyBasicAuth",
+                            "username": "aws",
+                            "allowedPasswords": ["prod-admin"],
+                        },
+                    }
+                ],
             }
         )
 
@@ -233,7 +285,7 @@ class AddonTests(unittest.TestCase):
                 "headers": {},
             },
             config,
-            aws_profile="dev",
+            proxy_basic_auth={"username": "aws", "password": "dev"},
         )
 
         self.assertTrue(decision["allowed"])

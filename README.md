@@ -267,7 +267,3 @@ config 読み込み、rule 評価、conditional passthrough、実際の `config/
 この proxy を通るように設定された通信は観測・制御できますが、process が別経路で通信できる環境では、この proxy だけで外部通信を完全に防ぐことはできません。必要なら OS、container、firewall、sandbox などと組み合わせてください。
 
 また、`~/.mitmproxy/mitmproxy-ca.pem` には CA の秘密鍵が含まれます。公開したり共有したりしないでください。
-
-## 関連
-
-- [zenn-agent-proxy.md](zenn-agent-proxy.md): Zenn 記事の下書き

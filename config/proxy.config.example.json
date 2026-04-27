@@ -1,0 +1,35 @@
+{
+  "host": "127.0.0.1",
+  "port": 8787,
+  "suppressTlsClientErrors": true,
+  "tls": {
+    "passthroughHosts": [
+      "localhost",
+      "127.0.0.1",
+      "ab.chatgpt.com",
+      "api.anthropic.com",
+      "registry.npmjs.org",
+      "api.openai.com",
+      "chatgpt.com",
+      "auth.openai.com",
+      "mcp.linear.app",
+      "github.com",
+      "*.github.com",
+      "*.githubusercontent.com"
+    ]
+  },
+  "requestFiltering": {
+    "inspectFallbackAllowedMethods": ["GET"],
+    "allowRules": [
+      {
+        "name": "authorization access token",
+        "methods": ["*"],
+        "protocols": ["https"],
+        "hosts": ["*.amazonaws.com"],
+        "headerPatterns": {
+          "X-Amz-Security-Token": ["your_aws_session_token"]
+        }
+      }
+    ]
+  }
+}

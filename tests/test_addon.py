@@ -77,7 +77,7 @@ class AddonTests(unittest.TestCase):
 
     def _load_repo_config(self) -> dict:
         config_path = (
-            Path(__file__).resolve().parents[1] / "config" / "proxy.config.json"
+            Path(__file__).resolve().parents[1] / "config" / "example.json"
         )
         return addon.load_config(str(config_path))
 

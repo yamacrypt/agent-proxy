@@ -24,8 +24,7 @@
   },
   "requestFiltering": {
     "inspectFallbackAllowedMethods": ["GET"],
-    "allowRules": [
-    ]
+    "allowRules": []
   },
   "conditionalPassthrough": [
     {
@@ -39,9 +38,10 @@
       "selector": {
         "type": "proxyBasicAuth",
         "username": "aws",
-        "allowedPasswords": ["prod-*"]
+        "allowedPasswords": ["prod-*", "breakglass"]
       },
       "onMissingSelector": "inspect"
     }
   ]
 }
+

@@ -89,7 +89,13 @@ ca_bundle = /etc/ssl/certs/ca-certificates.crt
 
 ## 設定ファイル
 
-設定は [config/proxy.config.json](config/proxy.config.json) に書きます。
+設定は `config/proxy.config.json` に書きます。このファイルはローカル用なので Git では追跡しません。
+
+初回は example をコピーして作ります。
+
+```bash
+cp config/example.json config/proxy.config.json
+```
 
 最小構成はこのような形です。
 
@@ -258,7 +264,7 @@ inspect された HTTP request は次の順で判定します。
 python3 -m unittest -v
 ```
 
-config 読み込み、rule 評価、conditional passthrough、実際の `config/proxy.config.json` の挙動をテストしています。
+config 読み込み、rule 評価、conditional passthrough、`config/example.json` の挙動をテストしています。
 
 ## 注意
 
